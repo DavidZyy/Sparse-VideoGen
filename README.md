@@ -81,11 +81,17 @@ git submodule update --init --recursive
 cd svg/kernels
 pip install -U cmake
 bash setup.sh
+
+# 5. Install FlashInfer (standard) and cuVS
+pip install flashinfer-python
+pip install cuvs-cu12 --extra-index-url=https://pypi.nvidia.com
+
+# Optional: If the FlashInfer monkey patch fails in your environment,
+# install the manually patched FlashInfer (block sparse with varied block sizes).
 cd 3rdparty/flashinfer
 cp ../../../../assets/patches/modifications.patch ./
 git apply modifications.patch
 pip install --no-build-isolation --verbose --editable . # Block Sparse Attention with varied block sizes
-pip install cuvs-cu12 --extra-index-url=https://pypi.nvidia.com # 
 ```
 
 You don’t need to install [flash-kmeans](https://github.com/svg-project/flash-kmeans) separately. A copy of flash-kmeans is included in Sparse VideoGen and is used by default.
