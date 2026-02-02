@@ -83,7 +83,8 @@ pip install -U cmake
 bash setup.sh
 
 # 5. Install FlashInfer (standard) and cuVS
-pip install flashinfer-python
+cd 3rdparty/flashinfer
+pip install --no-build-isolation --verbose --editable .
 pip install cuvs-cu12 --extra-index-url=https://pypi.nvidia.com
 
 # Optional: If the FlashInfer monkey patch fails in your environment,
