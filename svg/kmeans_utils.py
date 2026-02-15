@@ -467,7 +467,6 @@ _TUNE_CONFIGS = list(filter(_cfg_keep, _TUNE_CONFIGS))
 def _euclid_assign_kernel(
     x_ptr,  # *f16 / *f32 [B, N, D]
     c_ptr,  # *f16 / *f32 [B, K, D]
-    x_sq_ptr,  # *f32         [B, N]
     out_ptr,  # *i32         [B, N]
     B: tl.constexpr,
     N: tl.constexpr,
@@ -479,8 +478,6 @@ def _euclid_assign_kernel(
     stride_c_b: tl.constexpr,
     stride_c_k: tl.constexpr,
     stride_c_d: tl.constexpr,
-    stride_xsq_b: tl.constexpr,
-    stride_xsq_n: tl.constexpr,
     stride_out_b: tl.constexpr,
     stride_out_n: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -508,10 +505,6 @@ def _euclid_assign_kernel(
     x_tile = tl.load(x_ptrs, mask=n_mask[:, None], other=0.0)
     x_tile = x_tile  # compute in f32
 
-    # Pre-load x_sq for the tile  (BLOCK_N,)
-    xsq_ptrs = x_sq_ptr + pid_b * stride_xsq_b + n_offsets * stride_xsq_n
-    x_sq_tile = tl.load(xsq_ptrs, mask=n_mask, other=0.0).to(tl.float32)
-
     # Init best distance / index
     best_dist = tl.full((BLOCK_N,), 3.4e38, tl.float32)  # large number
     best_idx = tl.zeros((BLOCK_N,), tl.int32)
@@ -535,8 +528,7 @@ def _euclid_assign_kernel(
         cross = tl.dot(x_tile, c_tile).to(tl.float32)  # float32
 
         # Squared Euclidean distance
-        dist = x_sq_tile[:, None] + cent_sq[None, :] - 2.0 * cross
-        dist = tl.maximum(dist, 0.0)
+        dist = cent_sq[None, :] - 2.0 * cross
 
         # Mask out invalid centroid columns before reduction
         dist = tl.where(k_mask[None, :], dist, 3.4e38)
@@ -563,7 +555,6 @@ def _euclid_assign_kernel(
 def euclid_assign_triton(
     x: torch.Tensor,
     centroids: torch.Tensor,
-    x_sq: torch.Tensor,
     out: torch.Tensor = None,
     *,
     BLOCK_N: int = 128,
@@ -579,14 +570,13 @@ def euclid_assign_triton(
     Returns:
         cluster_ids (B, N) int32 (callers can cast to int64 if desired)
     """
-    assert x.is_cuda and centroids.is_cuda and x_sq.is_cuda, "All tensors must be on CUDA"
+    assert x.is_cuda and centroids.is_cuda, "All tensors must be on CUDA"
     # assert x.dtype in (torch.float16, torch.float32), "x must be fp16/fp32"
     assert centroids.dtype == x.dtype, "centroids dtype mismatch"
 
     B, N, D = x.shape
     K = centroids.shape[1]
     assert centroids.shape == (B, K, D), "centroids shape mismatch"
-    assert x_sq.shape == (B, N), "x_sq shape mismatch"
 
     # x = x.contiguous()
     # centroids = centroids.contiguous()
@@ -598,7 +588,6 @@ def euclid_assign_triton(
     # Strides (in elements)
     stride_x_b, stride_x_n, stride_x_d = x.stride()
     stride_c_b, stride_c_k, stride_c_d = centroids.stride()
-    stride_xsq_b, stride_xsq_n = x_sq.stride()
     stride_out_b, stride_out_n = out.stride()
 
     grid = lambda META: (triton.cdiv(N, META["BLOCK_N"]), B)
@@ -606,7 +595,6 @@ def euclid_assign_triton(
     _euclid_assign_kernel[grid](
         x,
         centroids,
-        x_sq,
         out,
         B,
         N,
@@ -618,8 +606,6 @@ def euclid_assign_triton(
         stride_c_b,
         stride_c_k,
         stride_c_d,
-        stride_xsq_b,
-        stride_xsq_n,
         stride_out_b,
         stride_out_n,
     )
@@ -628,13 +614,13 @@ def euclid_assign_triton(
 
 # 1. Euclidean
 @time_logging_decorator("Level 5 - batch kmeans euclid iter")
-def _euclid_iter(x, x_sq, centroids):
+def _euclid_iter(x, centroids):
     # cent_sq = (centroids ** 2).sum(dim=-1)
     # cross = torch.einsum('bnd,bkd->bnk', x, centroids)
     # dist_sq = (x_sq[:,:,None] + cent_sq[:,None,:] - 2.0 * cross).clamp_min_(0.0)
 
     # cluster_ids = dist_sq.argmin(dim=-1)
-    cluster_ids = euclid_assign_triton(x, centroids, x_sq)
+    cluster_ids = euclid_assign_triton(x, centroids)
     centroids_new, cluster_sizes = triton_centroid_update_sorted_euclid(x, cluster_ids, centroids)
     # centroids_new = triton_centroid_update_euclid(x, cluster_ids, centroids)
 
@@ -701,9 +687,6 @@ def batch_kmeans_Euclid(x, n_clusters, max_iters=100, tol=1e-4, init_centroids=N
     """
     B, N, D = x.shape
 
-    # Pre-compute squared L2 norm of all points (constant during iterations)
-    x_sq = (x**2).sum(dim=-1)  # (B, N)
-
     if init_centroids is None:
         # Randomly select initial centers from x
         indices = torch.randint(0, N, (B, n_clusters), device=x.device)
@@ -716,7 +699,7 @@ def batch_kmeans_Euclid(x, n_clusters, max_iters=100, tol=1e-4, init_centroids=N
 
     for it in range(max_iters):
         # ---- compiled single iteration ----
-        centroids_new, center_shift, cluster_ids, cluster_sizes = _euclid_iter_compiled(x, x_sq, centroids)
+        centroids_new, center_shift, cluster_ids, cluster_sizes = _euclid_iter_compiled(x, centroids)
 
         # 4. Check for convergence
         if verbose:
